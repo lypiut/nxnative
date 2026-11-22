@@ -4,17 +4,19 @@ import importlib.util
 import json
 import os
 import re
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
 spec = importlib.util.spec_from_file_location('launcher_settings', ROOT / 'dm/games/settings.py')
 settings = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(settings)
 
-BOTW, WONDER = '01007EF00011E000', '010015100B514000'
+BOTW, WONDER, OOT = '01007EF00011E000', '010015100B514000', '0400486024DEC000'
 PERFORMANCE_NVN = ['DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_FPS_HOLD', 'DM_METAL_HUD']
 
 
@@ -80,6 +82,21 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only)
         s = mac['DM_FULLSCREEN']
         self.assertEqual((s['kind'], s['default'], s['options'], s['level']), ('choice', '0', [['0', 'Window'], ['1', 'Fullscreen']], 'basic'))
+
+    def test_hdr_is_mac_only_and_only_for_a_profile_that_renders_it(self):   # DM_HDR (nvn/hdr.c): the profile's hdr key (Ocarina of Time) and the Mac front end's screen
+        oot = build(OOT, 'nvn', 'mac')
+        s = oot['DM_HDR']
+        self.assertEqual((s['kind'], s['default'], s['options'], s['section']),
+                         ('choice', 'auto', [['auto', 'On (HDR screens)'], ['0', 'Off']], 'Game'))
+        self.assertNotIn('DM_HDR', build(OOT, 'nvn', 'ios'))   # iOS presents SDR
+        self.assertNotIn('DM_HDR', build(BOTW, 'nvn', 'mac'))   # no hdr key in its profile
+
+    def test_hdr_candidate_import_is_only_a_candidate(self):   # nso_syms: an import classifies, the profile's hdr key still decides
+        from dm.tools import nso_syms
+        hook = (ROOT / 'dm/gfx/hle_vi.c').read_text()
+        self.assertIn(nso_syms._QUERY_DISPLAY_HDR_STATUS, hook)   # the detector watches the exact ABI the host takes over
+        self.assertFalse(nso_syms.hdr_import_capable(()))   # no modules: not a candidate, and never an automatic enable
+        self.assertIn('hdr', (ROOT / 'dm/games' / OOT / 'game.tsv').read_text())
 
     def test_defaults_follow_each_platform_host(self):
         # nvn_mtl.m pso4_on: Mac defaults on, iOS follows the profile. nvn_rec.h rec_on: iOS on, Mac off.

@@ -123,10 +123,12 @@ struct LauncherView: View {
     @ObservedObject var m: LauncherModel
     let done: (Bool) -> Void
     let fit: (CGFloat) -> Void
+    var screen: NSScreen? = nil   // the window's screen, so the HDR status line names the display the game will open on
     @AppStorage("window.show") private var show = true
     @AppStorage("window.advanced") private var advanced = false
     @State private var checking = false
     @State private var check = 0   // which Play the running check is for: one the player went on from without it is dropped
+    @State private var hdrScreen: NSScreen?   // refreshed if the display configuration changes while the window is open
 
     var body: some View {
         VStack(spacing: 0) {
@@ -161,6 +163,12 @@ struct LauncherView: View {
                 $0.contentSize.height + $0.contentInsets.top + $0.contentInsets.bottom - $0.containerSize.height
             } action: { _, extraHeight in
                 fit(extraHeight)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification)) { _ in
+                hdrScreen = NSScreen.main   // a display change while the window is open updates the HDR indicator
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                hdrScreen = NSScreen.main
             }
             HStack {
                 Toggle("Show this window at launch", isOn: $show).toggleStyle(.checkbox)
@@ -202,9 +210,40 @@ struct LauncherView: View {
             if !rows.isEmpty {
                 Section(section) {
                     ForEach(rows) { SettingRow(s: $0, m: m) }
+                    if rows.contains(where: { $0.env == "DM_HDR" }) {
+                        HdrDisplayStatus(screen: hdrScreen ?? screen ?? NSScreen.main, choice: m.values["DM_HDR"] ?? "auto")
+                    }
                 }
             }
         }
+    }
+}
+
+// Static, read-only information under the HDR row: the display the game will open on and whether it can
+// show HDR. Apple defines EDR support as a potential headroom greater than 1.0, independent of the display's
+// brand or current headroom; the host uses the same test in hdr.h. The game re-checks its own window's screen
+// after launch, so moving the window still switches HDR live. This does not change the saved choice or an
+// env.txt DM_HDR=0 override.
+private struct HdrDisplayStatus: View {
+    let screen: NSScreen?
+    let choice: String
+
+    var body: some View {
+        let potential = screen?.maximumPotentialExtendedDynamicRangeColorComponentValue ?? 0
+        let capable = potential.isFinite && potential > 1.0
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Display: \(screen?.localizedName ?? "Unknown")")
+            if choice == "0" {
+                Text("HDR is off. The game will use SDR.")
+            } else if capable {
+                Text("HDR available")
+            } else {
+                Text("HDR unavailable on the current display. The game will use SDR.")
+            }
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -352,7 +391,7 @@ private final class Launcher: NSObject, NSApplicationDelegate, NSWindowDelegate 
         if let screen = w.screen ?? NSScreen.main {
             w.setFrameTopLeftPoint(NSPoint(x: screen.visibleFrame.midX - w.frame.width / 2, y: screen.visibleFrame.maxY))
         }
-        let host = NSHostingView(rootView: LauncherView(m: model, done: { [weak self] in self?.finish($0) }, fit: { [weak self] in self?.fit($0) }))
+        let host = NSHostingView(rootView: LauncherView(m: model, done: { [weak self] in self?.finish($0) }, fit: { [weak self] in self?.fit($0) }, screen: w.screen ?? NSScreen.main))
         host.sizingOptions = []   // the Form's measured scroll content owns the height, including after collapse
         w.contentView = host
         host.layoutSubtreeIfNeeded()

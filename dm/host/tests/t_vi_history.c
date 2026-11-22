@@ -41,5 +41,30 @@ int main(void) {
     assert(fi[5][3] == ticks(g_gns - 1000000000ull));   // the first-seen time stays
     assert(h_vi_FrameHist(fi, 2, NULL) == 2 && fi[0][1] == 10 && fi[1][1] == 9);   // a smaller buffer gets the newest
     puts("vi frame history: count query 8, newest first, shown once handed on, presented or first-seen tick, dropped frames shown, queued ones not");
+    // Native HDR: vi answers SDR until the PQ layer is ready, then HDR with format 1 and a peak from the
+    // screen's headroom; the setting stays auto across screens and the game's layer metadata is kept.
+    setenv("DM_HDR", "auto", 1);
+    uint8_t on = 9; uint32_t fmt = 9; uint16_t peak = 9, pw = 0;
+    assert(h_vi_HdrStatus(&on, &fmt, &peak, NULL) == RES_OK && on == 0 && fmt == 0 && peak == 0);
+    assert(h_vi_PaperWhite(&pw, NULL) == RES_OK && pw == HDR_PAPER_WHITE_DEFAULT);
+    dm_hdr_boot();
+    dm_hdr_screen(16.0, 8.0, 1000);
+    assert(dm_hdr_layer_tick(0, 1000) == 1 && dm_hdr_layer_tick(1, 1000) == 1);   // layer made, then ready
+    assert(h_vi_HdrStatus(&on, &fmt, &peak, NULL) == RES_OK && on == 1 && fmt == 1 && peak == 800 && dm_hdr_told());
+    dm_hdr_present(1);
+    dm_hdr_screen(1.0, 1.0, 2000); dm_hdr_screen(1.0, 1.0, 2600);
+    assert(dm_hdr_layer_tick(1, 2600) == 1);   // keep the PQ layer until the game redraws SDR
+    dm_hdr_present(0); dm_hdr_present(0);
+    assert(dm_hdr_layer_tick(0, 2700) == 0 && h_vi_HdrStatus(&on, &fmt, &peak, NULL) == RES_OK && on == 0 && fmt == 0 && peak == 0);
+    assert(dm_hdr_pref() == HDR_PREF_AUTO);
+    assert(h_vi_HdrStdLum(NULL, 0, 203) == RES_OK && h_vi_HdrExtLum(NULL, 0, 710) == RES_OK &&
+           h_vi_HdrGamut(NULL, 1) == RES_OK && h_vi_HdrToneMap(NULL, 0) == RES_OK);
+    dm_hdr_meta m; dm_hdr_meta_get(&m);
+    assert(m.set && m.std_hi == 203 && m.ext_hi == 710 && m.gamut == 1 && m.tone == 0);
+    assert(h_vi_HdrBezier(NULL, 1, 2, 3) == RES_OK && h_vi_HdrGamutClear(NULL) == RES_OK);
+    // A guest may pass null pointers for the outputs it does not want; none of the responses may fault.
+    assert(h_vi_HdrStatus(NULL, NULL, NULL, NULL) == RES_OK);
+    assert(h_vi_PaperWhite(NULL, NULL) == RES_OK);
+    puts("vi HDR: SDR until the layer is ready, then HDR format 1 and peak 800, SDR again on an SDR screen, paper white and metadata kept");
     return 0;
 }

@@ -251,6 +251,60 @@ The PR author compiled 160 mesh prewarm descriptors per target on `g13s`, `g13d`
 
 A matched Mac rebuild on the same toolchain compiled all 500 native mesh keys and the 1,000 companion keys selected by the builder on both chains (`26e1a5f38264` and `5468682c3cdf`). The only MSL differences were the expected changes to 44 mesh shaders. Reflection matched after excluding the chain stamp.
 
+## Native HDR10 (current)
+
+- The profile has `hdr on`, so `DM_HDR` defaults to `auto` on the Mac. The game asks `vi::QueryDisplayHdrStatus` every frame (main+0x346c680) and switches its window textures between RGBA8 (0x25) and RGB10A2 (0x3d) on the answer (main+0x5702c0), with its own tone mapping: the host does not make HDR from SDR. `DM_HDR=0` keeps the original SDR path byte-for-byte.
+- Decision and presentation ([Native HDR10 presentation](../../../docs/reference/rendering.md#native-hdr10-presentation-dm_hdr)): HDR is answered when the window's screen reports potential EDR headroom greater than 1.0 — Apple's documented capability test, independent of the display's brand or current headroom — and its RGB10A2 / BT.2100 PQ layer is ready. vi answers output format 1 (the SDK's `on = (format == 1)`, verified on this build in PR #1176), paper white 100 nits and a peak from the screen's current headroom. The game's PQ window is presented unchanged into the PQ drawable: no PQ decode, no second tone map, one extra pipeline per drawable format only. Paper white is mapped to the screen's ordinary SDR white; 203 nits made the picture about twice as bright as SDR in PR #1176.
+- The layer uses `MTLPixelFormatRGB10A2Unorm`, matching the game's source channel order (Apple's own PQ example uses BGR10A2Unorm; no channel swap is needed here). `CAEDRMetadata` is not attached: PR #1176 saw stale-frame rectangles with it in fullscreen on the Mac, and a later isolated linear-EDR experiment found no benefit ([findings](#hdr-calibration-and-metadata-findings-2026-11-22)). Screen, brightness and fullscreen changes switch the layer on the main thread; the PQ layer is kept until two presents in a row were not the HDR window.
+- Screenshots of the HDR window are tone-mapped to SDR PNGs, never raw PQ bytes as sRGB; `DM_HDR_SHOT_RAW` and `DM_HDR_SHOT_HEIC` add diagnostic captures. `DM_HDR_LOG=1` logs the state machine, headroom, layer and peak.
+- **MetalFX:** one **Upscaling** setting now drives both colour modes. Standard scales bilinearly; MetalFX uses the perceptual scaler for SDR bytes and the linear-light path for PQ pictures — the SDR scaler must never see PQ codes. `t_hdr_mfx` accepts both RGB10A2 → RGB10A2 (the old direct-PQ experiment, codes 71..813 from a 100..594 source) and RGBA16Float → RGBA16Float in HDR mode. The HDR path, selected by `DM_PRESENT_UPSCALE=metalfx`, uses the latter with a source-resolution PQ decode (nits / 10000, so the tone map stays in a precise half-float range) and one PQ encode in the final present; flat patches are exact and the same sharp-edge pattern reads 65..627, six flat patches from 10 to 2000 nits are within one code, and ringing is confined to a few pixels. The headroom shoulder is applied once after scaling, decode/scaler failures fall back to bilinear, no decode or scaler work happens when the picture is not enlarged, and transition frames keep their conversion pass. `DM_HDR_UPSCALE` is now only an HDR-only diagnostic override (`off` / `hdrfx`; unset follows the player and is logged when set). Synthetic GPU medians at 5K vary from 0.30-0.62 ms (bilinear) against 1.34-6.11 ms (MetalFX) across runs, excluding gameplay; the player accepted about 2 ms of extra display-command-buffer GPU time at 5K in the live sessions below. Standard remains the default.
+- **Regression coverage (2026-11-22):** the CPU test now checks PQ against externally computed nits/code pairs at 10–10000 nits, 10-bit quantisation, near black, monotonicity over all 1024 codes, NaN/Inf, RGB10A2 channel order and alpha-independence, and the BT.2020→BT.709 matrix element by element against a derivation from the chromaticities (188 assertions). The real Metal present test adds the fifth combination (mode-4 roll-off: knee, target, PQ knee code, highlight lowered while paper white is unchanged), alpha on the output, an HDR crop, a non-integer scale and a letterbox with black bars (226 assertions in each of five runs). A real `CAMetalLayer` fixture in the same test checks the layer's pixel format, colour space and EDR flag, the format of the drawable actually handed out, and the VI answer through SDR→HDR→SDR→HDR and rapid switches; a drawable taken before a layer switch is drawn in its own format, so an in-flight frame is not misclassified. `t_hdr_mfx` asserts the exact RGB10A2 PQ→PQ HDR descriptor is accepted; it remains a format check, not a correctness claim. `test_hdr_bench.py` parses synthetic benchmark logs. `t_hdr` is in the CPU-only list in `.github/workflows/tests.yml`; the Metal tests stay local. These are CPU and local-Metal tests only: the front end's layer mutation, the game's handshake in play, composited output and physical luminance are not reproduced by them.
+- **Status (validated on the target):** an app built from the HDR branch and played by the fork owner on this M4 Pro / Studio Display XDR (potential headroom 16, current rising 1.2 → 16) logged `state HDR_ACTIVE`, `vi answers HDR, output format 1, peak 1600 nits, paper white 100 nits`, and the game's second `WindowInitialize` with `format 0x3d` (RGB10A2): the game really switched to its HDR window. The Metal HUD showed `RGB10A2Unorm` composited at 2.0x, 58.9-62.0 fps with a 16.16-16.60 ms frame interval, GPU 9.48-10.31 ms and 0-7 missed frames over 1,800-5,578 frames in the title screen and two indoor scenes. No black/stale rectangles, highlight ringing or colour shifts were seen; the two `[RED] texture type mismatch` lines in the log are the same ones the previous build logged before this change. A matched SDR/HDR frame-time A/B and the other listed scenes remain open.
+
+### HDR calibration and metadata findings (2026-11-22)
+
+The game declares its HDR output intent through `nn::vi` layer metadata (`dm/gfx/hle_vi.c:179-198`). The host records it for diagnostics and for the shoulder's source estimate; the architecture and decision are in [Native HDR10 presentation](../../../docs/reference/rendering.md#native-hdr10-presentation-dm_hdr). The full investigations remain on the `experiment/caedrmetadata` branch (`docs/reference/nintendo-hdr-calibration-investigation.md` and `docs/reference/edr-metadata-experiment.md`); only conclusions and evidence are kept here.
+
+**The 3.5× rule is Ocarina's policy, not an SDK constant.** A controlled sweep on [PR #1176](https://github.com/seedds/nxnative/pull/1176) established `extended_hi = min(reported_peak, 3.5 × paper_white)`:
+
+| Told peak | Paper white | Declared extended range |
+|---:|---:|---:|
+| 1000 (default) | 203 | 710 |
+| 1600 | 203 | 710 |
+| 400 | 203 | 400 |
+| 1000 | 300 | 1000 |
+
+Our live runs with 100-nit paper white declared **350**, and the game re-declared `710 → 650 → 710` as the host's automatic peak moved with display brightness. Other games use different formulas (Donkey Kong Bananza `min(peak, 1400)`, Mario Kart World ≈1.6–1.8 × peak). The declared range is therefore an **authored HDR output target**, not a guaranteed maximum pixel value, HDR10 mastering-display metadata, or MaxCLL. The game already adapts its output to the reported VI peak, so the host shoulder is normally inactive at steady state (`source ≤ target`) and mainly protects transitional headroom changes or a fixed peak above current headroom.
+
+**Measured source luminance.** Two raw `DM_HDR_SHOT_RAW` captures of the game's 2560x1440 RGB10A2 window, decoded with the ST 2084 inverse transfer function (verified: code 520 → 100.2 nits):
+
+| Scene | Median | p99 | Maximum | >100 nits | >350 nits |
+|---|---:|---:|---:|---:|---:|
+| Dark interior | 8.7 nits | 58 nits | 588 nits | 0.022% | 0.001% |
+| Daylight | 13.5 nits | 95 nits | 717 nits | 0.334% | 0.003% |
+
+These are observations from two specific frames, not universal properties of the game. Isolated pixels exceed the declared 350-nit range, confirming that the declaration is a tone-map target rather than a hard content cap; nothing exceeded 800 nits in either capture.
+
+**CAEDRMetadata decision: not adopted.** An isolated experiment compared native PQ, linear EDR without metadata and linear EDR with `CAEDRMetadata`. The linear pipeline was validated numerically (PQ → linear BT.2020, `nits / 100` with `opticalOutputScale=100`) and with real RGBA16Float drawables in extended-linear BT.2020, with metadata set before `nextDrawable()`. It produced no visible improvement over native PQ and no visible difference between the two linear modes in live play. It also added about 0.2 ms of host display-command-buffer GPU time at 5K, doubled drawable pixel storage (112.5 MiB vs 56.25 MiB at 5K), left the compositor's own tone-mapping cost unmeasured, and had no defensible mastering-metadata source. This is an evidence-based decision for this implementation, not a claim that Apple's API is inherently unsuitable.
+
+### Live present comparison (2026-11-22)
+
+The fork owner played sequential sessions on the M4 Pro / Studio Display XDR with the bundled app (commit `176c171b`, chain `648a020c093b`), `DM_HDR_LOG=1 DM_HDR_BENCH=1 DM_METAL_HUD=1`, and took screenshots in each configuration. The HDR sessions used the `DM_HDR_UPSCALE` diagnostic (`off` / `hdrfx`); after the unification the same two selections are made by `DM_PRESENT_UPSCALE=off` / `metalfx` alone. No inputs were automated and no save, game asset or shader cache was touched. The scenes were chosen by the player, so these are indicative measurements, **not** a matched-scene A/B.
+
+| session | display command buffer (GPU p50) | frame p50 (warm) | notes |
+|---|---|---|---|
+| SDR bilinear (`DM_HDR=0, DM_PRESENT_UPSCALE=off`) | 0.259 ms via bilinear | 16.3–19.9 ms | layer SDR, VI peak 0 |
+| SDR MetalFX (`DM_HDR=0, DM_PRESENT_UPSCALE=metalfx`) | 1.736 ms via perceptual MetalFX, 2560x1440 → 5120x2880 | 16.4 ms | same SDR layer and VI answer |
+| HDR Standard / bilinear (`DM_HDR=auto, DM_PRESENT_UPSCALE=off`) | 0.290–0.303 ms via bilinear | 16.6 ms | layer PQ, headroom 1.2 → 16, VI format 1, peak 1600, paper white 100 |
+| HDR MetalFX (`DM_HDR=auto, DM_PRESENT_UPSCALE=metalfx`) | 2.299–2.314 ms via linear-light HDR MetalFX, RGBA16Float → RGBA16Float 2560x1440 → 5120x2880 | 16.6–17.2 ms | same negotiation, no new red lines |
+
+The four captures, taken at the same Kokiri-village view, are:
+
+![SDR bilinear](screenshots/sdr-bilinear.jpg) ![SDR MetalFX](screenshots/sdr-metalfx.jpg)
+![HDR bilinear](screenshots/hdr-bilinear.jpg) ![HDR MetalFX](screenshots/hdr-metalfx.jpg)
+
+The HDR handshake was identical in both HDR runs. Compared with HDR bilinear, the HDR scaler adds about 2 ms of display-command-buffer GPU time at 5K, close to the ~1.5 ms SDR MetalFX adds over SDR bilinear; no clear 60 fps frame-time regression was seen in these sessions. The fork owner accepted this cost, so MetalFX is now an explicit player choice in both SDR and HDR while Standard stays the default. Run-to-run scene variation and the cumulative late-latch counter prevent a firmer conclusion. One pre-existing `texture type mismatch` red line appeared in an HDR bilinear session; no new red lines or invalid drawable formats appeared in the HDR MetalFX sessions. Core Animation output and physical luminance were not measured; these numbers are host/GPU timing evidence only. A scene-matched image-quality comparison of the screenshots is still open.
+
 ## Open
 
 - Root cause confirmed on M4 Pro (2026-11-08): [ignored event waits](../../../docs/reference/nvn-objects.md#gpu-event-waits-order-work-across-queues) let lighting consumers run before their producers. The game issues about 25 waits and 19 signals per frame. All 297 complete traced frames submit queue 5's ambient-cache consumer `9e6b00b050e30801` before queue 1's SH producer `21d9f83e6027c565`, despite the explicit dependency. Queue 1 also waits for the CPU frame-ready event after the CPU clears the lighting buffer. At frame 3872 the consumer ran at 0.686 ms, the clear at 0.966–0.968 ms, and the producer at 1.282 ms; its release followed at 4.467 ms. Exposure writer `1bba09ec4bc8ff67` has another event dependency. The native SDK's flush/invalidate functions are no-ops for these coherent pools.
@@ -301,6 +355,8 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 ## Found on this game
 
 - [Autoreleased temporaries collect during background pipeline builds](../../../docs/reference/memory.md#autoreleased-temporaries-collect-during-background-pipeline-builds). The audit finding is resolved in the host.
+- [Native HDR10 presentation (DM_HDR)](../../../docs/reference/rendering.md#native-hdr10-presentation-dm_hdr). On this M4 Pro with a Studio Display XDR, the layer switches to RGB10A2 / BT.2100 PQ with no hang or validation error; the game's own HDR window in a warmed build and the frame-time/quality comparison are still open.
+
 - [Upload retirement can block Metal 4 feedback](../../../docs/reference/memory.md#upload-retirement-can-block-metal-4-feedback). NX18 reported a freeze on an iPhone 18 Pro Max after loading a save. A synthetic lock stall reproduced the feedback blockage. The cause of the device freeze remains open.
 - [Going to the background while graphics do not drain](../../../docs/reference/nvn-objects.md#going-to-the-background-while-graphics-do-not-drain): NX18's iPhone 18 Pro Max run froze before the background transition. The host now bounds the transition's graphics wait and starts persistence independently. The cause of the initial freeze and the revised iOS behavior are open.
 

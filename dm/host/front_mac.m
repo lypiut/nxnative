@@ -18,6 +18,8 @@
 #include "dm_input.h"
 #include "front.h"
 #include "hle.h"
+#include "../gfx/nvn/hdr.h"
+#include <time.h>
 #include "pad_slots.h"
 #include "haptics_apple.h"
 #include "motion_apple.h"
@@ -77,6 +79,98 @@ int front_fullscreen(void) { return g_fullscreen; }   // nvn_mtl.m link_latency:
 // 1 → 2 → 3 vsync steps at latency 1, issue #347), and the fixed 60 Hz mode held 60.0 fps at latency 1 (docs/reference/frame-rate.md). A screen with no such mode keeps its rate, and
 // the 120 Hz link paces it (nvn_mtl.m link_vrr_120)
 static NSWindow *g_win; static _Atomic int g_match_want;   // the game's window; the frame rate to match (0 = not known yet), written by the present thread only
+
+// Native HDR10 output (DM_HDR). The window's layer stays exactly as front_run made it (BGRA8Unorm, original
+// colour space, no EDR) until hdr.c says a Switch 2 game with HDR on is on a screen that can show EDR. Then
+// it becomes RGB10A2 in BT.2100 PQ with wantsExtendedDynamicRangeContent: the game's HDR10 window is shown
+// as it is. All of this runs on the main thread; the present thread only reads the layer and chooses its
+// pipeline from the *drawable's* format, so a drawable taken before a switch is still drawn correctly.
+static int g_hdr_layer_pq;
+static CGColorSpaceRef g_hdr_sdr_cs; static int g_hdr_cs_kept;
+static NSTimer *g_hdr_timer;        // current-headroom poll, only while HDR is actually in use
+static NSTimer *g_hdr_settle;       // bounded one-shot that completes a pending capability change
+static int64_t g_hdr_settle_due;
+static double g_hdr_pot_logged = -1, g_hdr_cur_logged = -1;
+static int64_t front_hdr_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static void front_hdr_apply(int pq) {
+    if (!g_layer || pq == g_hdr_layer_pq) return;
+    g_hdr_layer_pq = pq;
+    if (pq) {
+        g_layer.pixelFormat = MTLPixelFormatRGB10A2Unorm;
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+        g_layer.colorspace = cs; CGColorSpaceRelease(cs);
+        g_layer.wantsExtendedDynamicRangeContent = YES;
+        LOG("[hdr] layer: RGB10A2, ITU-R BT.2100 PQ, extended dynamic range");
+    } else {
+        g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        g_layer.colorspace = g_hdr_cs_kept ? g_hdr_sdr_cs : NULL;   // the layer exactly as front_run made it
+        g_layer.wantsExtendedDynamicRangeContent = NO;
+        LOG("[hdr] layer: back to BGRA8Unorm, the original colour space, no EDR");
+    }
+}
+static void front_hdr_tick(void) {
+    if (!g_layer || !g_win) return;
+    // NSWindow.screen is the screen holding most of the window and nil when it is offscreen (Apple's
+    // NSWindow.screen documentation). No mainScreen fallback: an unrelated display must not turn a window
+    // with no screen into HDR. Display properties and every layer mutation below run on the main thread.
+    NSScreen *s = g_win.screen;
+    int64_t now = front_hdr_now_ms();
+    double pot = 0, cur = 1, ref = 0;
+    if (s) {
+        pot = s.maximumPotentialExtendedDynamicRangeColorComponentValue;
+        ref = s.maximumReferenceExtendedDynamicRangeColorComponentValue;
+        cur = hdr_output_headroom(s.maximumExtendedDynamicRangeColorComponentValue, ref);
+    } else {
+        static int offscreen_logged;
+        if (!offscreen_logged) { offscreen_logged = 1; LOG("[hdr] the game window has no screen: staying SDR"); }
+    }
+    dm_hdr_screen(pot, cur, now);
+    front_hdr_apply(dm_hdr_layer_tick(g_hdr_layer_pq, now));
+    // Re-tick with the layer the window has now: hdr.c's "ready" and its diagnostic state then match the
+    // drawable the present will actually get, instead of waiting for a timer. The vi answer still cannot run
+    // ahead of the layer -- the front end applies it before this second tick.
+    dm_hdr_layer_tick(g_hdr_layer_pq, now);
+    // A capability change is pending after ONE notification at most. Complete it with a bounded one-shot
+    // timer regardless of the current HDR state; a repeating poll that only exists while HDR is on cannot
+    // finish an SDR -> HDR transition. Re-arm when the due time moves after another change.
+    int64_t due = 0;
+    if (dm_hdr_pending(&due)) {
+        double wait = (double)(due - now) / 1000.0;
+        if (wait < 0.05) wait = 0.05;
+        if (wait > HDR_SETTLE_MS / 1000.0) wait = HDR_SETTLE_MS / 1000.0;
+        if (!g_hdr_settle || g_hdr_settle_due != due) {
+            [g_hdr_settle invalidate];
+            g_hdr_settle = [NSTimer timerWithTimeInterval:wait repeats:NO block:^(NSTimer *t) {
+                (void)t; g_hdr_settle = nil; front_hdr_tick();
+            }];
+            [NSRunLoop.mainRunLoop addTimer:g_hdr_settle forMode:NSRunLoopCommonModes];
+            g_hdr_settle_due = due;
+        }
+    } else if (g_hdr_settle) {
+        [g_hdr_settle invalidate]; g_hdr_settle = nil; g_hdr_settle_due = 0;
+    }
+    if (s && (fabs(pot - g_hdr_pot_logged) > 0.01 || fabs(cur - g_hdr_cur_logged) > 0.05 * fmax(g_hdr_cur_logged, 1))) {
+        g_hdr_pot_logged = pot; g_hdr_cur_logged = cur;
+        LOG("[hdr] '%s': potential headroom %.2f, current %.2f, reference %.2f, HDR %s (DM_HDR=%s)", s.localizedName.UTF8String,
+            pot, cur, ref, dm_hdr_on() ? "on" : "off", dm_hdr_pref() ? "auto" : "0");
+    }
+    // Apple posts NSApplicationDidChangeScreenParametersNotification when current headroom changes, and the
+    // observers below re-read the window's screen on it. Keep a short poll while HDR is in use: brightness
+    // changes are not always accompanied by that notice on every Mac. It stops as soon as HDR is off.
+    if (dm_hdr_on() && !g_hdr_timer) {
+        g_hdr_timer = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *t) { (void)t; front_hdr_tick(); }];
+        [NSRunLoop.mainRunLoop addTimer:g_hdr_timer forMode:NSRunLoopCommonModes];
+    } else if (!dm_hdr_on() && g_hdr_timer) {
+        [g_hdr_timer invalidate]; g_hdr_timer = nil;
+    }
+}
+// hdr.c reports that the two-SDR-picture exit condition has been met on the present thread. One hop to the
+// main queue is enough: front_hdr_tick then applies the SDR layer without another display event, and no
+// task is dispatched for the other presents of the run.
+void dm_hdr_settle_request(void) { dispatch_async(dispatch_get_main_queue(), ^{ front_hdr_tick(); }); }
 static CGDirectDisplayID g_match_id; static CGDisplayModeRef g_match_orig; static int g_match_orig_vrr;   // main thread: the screen this host switched, its own mode (NULL = none switched) and whether that mode is variable-refresh
 static double mode_hz(CGDisplayModeRef m) { double hz = CGDisplayModeGetRefreshRate(m); return hz > 0 ? hz : 0; }   // 0 = not known (older built-in screens report none)
 static int hz_multiple(double hz, int fps) { double k = round(hz / fps); return k >= 1 && fabs(hz / fps - k) < 0.01; }   // 59.94 Hz counts as 60
@@ -1615,6 +1709,10 @@ void front_run(void (*guest)(void)) {
         g_layer.device = MTLCreateSystemDefaultDevice();
         g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         g_layer.contentsScale = win.backingScaleFactor;
+        if (!g_hdr_cs_kept) {   // keep exactly the SDR configuration, to restore it when HDR is turned off
+            g_hdr_cs_kept = 1; g_hdr_sdr_cs = g_layer.colorspace;
+            if (g_hdr_sdr_cs) CGColorSpaceRetain(g_hdr_sdr_cs);
+        }
         // Apple's HUD over the game (frame rate, frame and GPU time, memory): front_hud_env turns it on before the first device. The layer's developerHUDProperties
         // stay unset: mode=default forces this layer's HUD on, so the Metal HUD menu's Hide HUD left it on screen
         if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) LOG("front end: Metal performance HUD on (DM_METAL_HUD)");
@@ -1623,6 +1721,8 @@ void front_run(void (*guest)(void)) {
         [win makeKeyAndOrderFront:nil];
         screen_refresh(win.screen ?: NSScreen.mainScreen);
         g_win = win;
+        if (dm_hdr_pref() == HDR_PREF_AUTO)   // HDR layer ready before the game's first vi status query
+            front_hdr_tick();
         [NSApp activateIgnoringOtherApps:YES];
         // A host another process starts (scripts/regress.py) is not activated (its focus state stays 2), so its window opened wherever it landed in the window order, and behind
         // another app's window macOS fires its display link about once a second: Breath of the Wild stepped up to 3 vsyncs at boot and never came back (20 fps runs).
@@ -1696,12 +1796,19 @@ void front_run(void (*guest)(void)) {
         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1).
         // Input is released when the window stops being key (and when it is minimized) and taken up again when it is key again
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); if (win.screen) g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); }];
+        // These observers run on the main queue: AppKit screen notifications can be posted off the main thread,
+        // but NSScreen reads and the CAMetalLayer mutations in front_hdr_tick must be on the main thread.
+        // The notification object identifies the window (screen change), the application (screen parameters)
+        // or a screen (colour space); none is assumed to carry the game window's screen -- every block re-reads
+        // g_win.screen, which is nil when the window is offscreen.
+        [nc addObserverForName:NSWindowDidChangeScreenNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); if (win.screen) g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); front_hdr_tick(); }];
+        [nc addObserverForName:NSApplicationDidChangeScreenParametersNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); front_hdr_tick(); }];
+        [nc addObserverForName:NSScreenColorSpaceDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; front_hdr_tick(); }];
+        [nc addObserverForName:NSWindowDidChangeBackingPropertiesNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; if (win.screen) g_layer.contentsScale = win.backingScaleFactor; front_hdr_tick(); }];
         // Entering and leaving fullscreen: the layer is layer-backed, so its frame (and with it the drawable) follows the
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
-        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
+        [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(win.screen); g_fullscreen = 1; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); front_hdr_tick(); }];
+        [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_fullscreen = 0; screen_refresh(win.screen); g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); front_hdr_tick(); }];
         // DM_FOCUS_KEEP=1 (scripts/regress.py): the game stays in focus while its window is up, whichever app is active. Tears of the Kingdom stops presenting out of focus, so
         // another app taking the key window during an unattended run read as a hang (no frame after the last focus change)
         static int keep = -1; if (keep < 0) keep = getenv("DM_FOCUS_KEEP") && atoi(getenv("DM_FOCUS_KEEP"));

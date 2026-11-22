@@ -43,7 +43,7 @@ Hades II goes up to 300 %: it renders its whole picture, the HUD and text includ
 
 ### Upscaling
 
-A game that renders below the screen's resolution is scaled up to the screen. **Standard**, the default, scales smoothly; **MetalFX** uses Apple's MetalFX upscaler, which sharpens edges and text as it scales.
+A game that renders below the screen's resolution is scaled up to the screen. **Standard**, the default, scales smoothly; **MetalFX** uses Apple's MetalFX upscaler, which sharpens edges and text as it scales. The same choice applies to native HDR10 on a supported Mac display: SDR pictures are scaled by a perceptual scaler and HDR pictures by a separate linear-light one, so there is no second HDR-upscaling option to set.
 
 ```mermaid
 flowchart LR
@@ -57,8 +57,8 @@ flowchart LR
 Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its world at 900p and scales that to 1080p itself, before the app sees the picture. MetalFX works in either mode: handheld saves the most GPU time and heat, docked looks sharper than smooth scaling. Rendering at the screen's resolution stays the sharpest picture, where the GPU can afford it.
 
 - **When to change it:** turn it on if the picture looks soft and the device has GPU time to spare: on a Mac, or on an iPhone in handheld mode at 30 fps. For long sessions at 60 fps on an iPhone leave it at Standard.
-- **Cost:** more GPU time each frame, which can increase heat on an iPhone. [Breath of the Wild's measurements](../dm/games/01007EF00011E000/README.md#upscaling-current) cover Mac and iPhone; the matching iPhone Standard run and MetalFX's share of the thermal cost remain unmeasured. Nothing changes while the game's picture is as large as the screen. Unsupported devices and sizes use Standard scaling.
-- **On the Mac:** choose **MetalFX** under **Upscaling** in the [settings window](#the-mac-settings-window)'s Advanced settings, or set `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` (off by default). It helps in a large window or on a 4K screen.
+- **Cost:** more GPU time each frame, which can increase heat on an iPhone. [Breath of the Wild's measurements](../dm/games/01007EF00011E000/README.md#upscaling-current) cover Mac SDR; the matching iPhone Standard run and MetalFX's share of the thermal cost remain unmeasured. On an M4 Pro the HDR scaler adds about 2 ms of display-command-buffer GPU time at 5K over HDR Standard ([Ocarina of Time's live comparison](../dm/games/0400486024DEC000/README.md#live-present-comparison-2026-11-22)); this cost was accepted by the player. Nothing changes while the game's picture is as large as the screen. Unsupported devices and sizes use Standard scaling.
+- **On the Mac:** choose **MetalFX** under **Upscaling** in the [settings window](#the-mac-settings-window)'s Advanced settings, or set `DM_PRESENT_UPSCALE=metalfx` in its `env.txt` (off by default). It helps in a large window or on a 4K screen, and applies to HDR10 on an HDR-capable display as well as to SDR.
 
 ### Game's upscaler
 
@@ -234,6 +234,12 @@ Turn off **Show this window at launch** to start the game at once with your choi
 
 **Window** or **Fullscreen**: how the game's window opens. ⌃⌘F or the green button changes it while you play. In an `env.txt`: `DM_FULLSCREEN=1` or `0`.
 
+### HDR
+
+**On (HDR screens)** by default for a game that draws HDR itself (Ocarina of Time). On a screen that can show HDR, such as the Studio Display XDR, the game is told the display is HDR, draws its own HDR picture and the host presents its BT.2020 PQ values in a 10-bit extended-dynamic-range layer: highlights go brighter than the ordinary white while the HUD stays at the screen's usual brightness. On a screen without HDR the game draws its usual picture. Moving the window between screens, docking or entering full screen switches it within a frame or two and back again, without changing this setting. Screenshots are tone-mapped to SDR. **Off** always draws the usual picture. In an `env.txt`: `DM_HDR=auto` or `0`.
+
+The Mac settings window shows the display the game will open on and whether it can show HDR beneath this row: `HDR available`, or `HDR unavailable on the current display. The game will use SDR.` An `env.txt` or launch override greys the row out and says so. The row is shown only for games whose profile has verified native HDR support; importing the Switch 2 HDR API only makes a game a candidate and never enables HDR on its own. The game re-checks the display after launch, so moving the window still switches live.
+
 ### Switch 2 controllers
 
 **Off** by default. On, the game takes Joy-Con 2 and Pro Controller 2 over Bluetooth: hold the small Sync button on one during the game, until its player lights sweep, to pair it with this Mac; after that a press of any of its buttons connects it ([Switch 2 controllers](playing.md#switch-2-controllers-mac)). macOS asks for Bluetooth access the first time, and again after the app is packed again. In an `env.txt`: `DM_SW2=1`.
@@ -273,6 +279,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Console mode | `DM_OPMODE` | `1` docked, `0` handheld |
 | Game language | `DM_LANG` | a language code, such as `ja` |
 | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
+| HDR (Mac, supported games) | `DM_HDR` | `auto` on a screen that can show HDR (default for a game that draws HDR), `0` off |
 | Cloud saves folder (Mac) | `DM_SAVE_SYNC` | a folder; `icloud`: iCloud Drive › nxnative Saves; `0`: off |
 | Picture (iPhone and iPad) | `DM_PICTURE_FIT` | `fit` 16:9 with black bars, `fill` covers the screen, cropped |
 | Picture shape | `DM_SCREEN_ASPECT` | On builds with screen-shape stubs, `auto` the app window's own shape where it is taller than 16:9 (iPad 4:3, iPhone Duo 1.43:1), else 16:9 (iOS only); `1.6` MacBook (16:10, Mac only); `1.43` the iPhone Duo's shape, `0` 16:9 |

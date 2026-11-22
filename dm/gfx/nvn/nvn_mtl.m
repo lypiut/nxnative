@@ -43,6 +43,7 @@
 #include "msl_image.h"
 #include "dmsh_chain.h"   // DMSH_CHAIN: the translation chain version of the B shader library expected by this source tree, one for every game (beside this file, tools/dmsh_chain.py --header)
 #include "game_profile.h"   // game profile constants (profile id, the profile's switches)
+#include "hdr.h"   // native HDR10 output: the shared state and the colour constants (dm/gfx/nvn/hdr.h)
 // Texture slot table per stage: 0-127 the combined handles (nvnCommandBufferBindTexture), 128-255 the separate texture binds (NVN_SEPTEX_SLOT0, nvn_obj.h)
 #define NTEX 256
 // The NVN driver's constant segments c0 and c2 (byte offsets, slot counts) and the binding kinds of the shader reflection have one definition, which the shader build reads too (dmsh_build.py through dmsh_abi.py)
@@ -161,6 +162,10 @@ static void geo_mesh_ft_change(void);   // nvn_geometry.inc
 static uint64_t g_vbuf_resolve, g_vbuf_reuse, g_vbuf_set, g_vbuf_skip, g_vbuf_copies, g_vbuf_copy_bytes;   // copies: vertex streams at addresses not 4-byte aligned (vbuf_unaligned)
 static id<MTL4ArgumentTable> g_present_args;
 static id<MTLBuffer> g_present_uv[3];
+// The opt-in linear-light HDR scaler needs a second decode pass with its own texture/sampler binding and
+// constants; the present argument table and UV buffer already hold the final pass's state at commit time.
+static id<MTL4ArgumentTable> g_fx_decode_args[3];
+static id<MTLBuffer> g_fx_decode_uv[3];
 static uint64_t g_present_alloc_fence[3];
 // Under g_pq_mu: per present allocator, the newest ticket its commit feedback reported done on the GPU. present_now resets an allocator only once this reaches the ticket that
 // last used it. g_pq_done is not that: every display-link callback sets it to ticket - 1 (the previous present was committed, not run) and a present that was not submitted sets
@@ -955,9 +960,14 @@ static void mtl_init_once(void) {
     g_present_args = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
     if (!g_present_args) MDIE("failed to create the present argument table: %s", ate.localizedDescription.UTF8String);
     for (int i = 0; i < 3; i++) {
-        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+        g_present_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];   // crop (8) + HDR conversion parameters (8)
         if (!g_present_uv[i]) MDIE("failed to create present UV buffer[%d]", i);
         res_add(g_present_uv[i]);
+        g_fx_decode_args[i] = [g_dev newArgumentTableWithDescriptor:pad error:&ate];
+        if (!g_fx_decode_args[i]) MDIE("failed to create HDR decode argument table[%d]: %s", i, ate.localizedDescription.UTF8String);
+        g_fx_decode_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];
+        if (!g_fx_decode_uv[i]) MDIE("failed to create HDR decode UV buffer[%d]", i);
+        res_add(g_fx_decode_uv[i]);
     }
     g_ev = [g_dev newSharedEvent];
     g_keep = [NSMutableArray array];
@@ -18352,8 +18362,17 @@ void mtl_exec(const uint8_t *p) {
 }
 
 // ---------- Present: draw the swapchain texture to the CAMetalLayer; optional screenshot ----------
-static id<MTLRenderPipelineState> g_blit_pso; static MTLPixelFormat g_blit_fmt;
+// Presentation pipelines are cached by the acquired drawable's format and the shader variant (the SDR
+// pass-through or the HDR conversion). A drawable taken before a layer switch keeps its own format, and a
+// screenshot alternates formats with the drawable, so a single pipeline made on first use was rebuilt for
+// every switch while command buffers using the old one could still be in flight (Metal 4 does not retain
+// them). The cache is made on first use and never recompiled during play.
+enum { PV_SDR, PV_HDR, PV_HDR_FX, PV_N };   // the last one encodes linear-light MetalFX output into PQ (opt-in)
+static struct { MTLPixelFormat fmt; int variant; __strong id<MTLRenderPipelineState> pso; } g_present_pso[8];
+static int g_present_pso_n;
+static pthread_mutex_t g_blit_mu = PTHREAD_MUTEX_INITIALIZER;
 static id<MTLSamplerState> g_blit_samp;
+static _Atomic int g_present_pso_new;   // present pipelines made (DM_HDR_BENCH)
 static uint64_t g_present_n;
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
 void mtl_res_snapshot(mtl_res_count *out) {
@@ -18393,6 +18412,7 @@ void mtl_res_counts(uint32_t tick, const char *why) {
 static struct { uint64_t frame; char path[1024]; } g_shotq[SHOTQ_MAX]; static int g_nshotq;
 static pthread_mutex_t g_shotq_mu = PTHREAD_MUTEX_INITIALIZER;
 static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4]);
+static int present_pq(id<MTLTexture> src);
 static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]);
 enum { PRESENT_FAILED, PRESENT_STANDARD, PRESENT_METALFX };
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int));
@@ -18441,7 +18461,69 @@ void dm_gfx_shot_at(long k, const char *path) {
 // of that size (with DM_PRESENT_UPSCALE=metalfx through MetalFX, on the Metal 4 queue: present_offscreen_m4); screen=0 (texture dump) is unaffected.
 // Without it, a window the game crops (nvnWindowSetCrop) is captured the same way at the window texture's own size: what is outside the crop is never presented and holds
 // whatever the texture held before (Bastion crops its 1920x1080 window textures to 1600x900; the strip outside was black in some runs and purple in others, which regress.py
-// took for a rendering change). An uncropped window is read as it is, so its shots are the texture's own pixels
+// took for a rendering change). An uncropped window is read as it is, so its shots are the texture's own pixels.
+// An HDR10 window is the exception: its PQ bytes are never written as sRGB ones, so screenshots always go
+// through the present pass, which converts them to an ordinary SDR image (present.metal mode 1).
+// DM_HDR_SHOT_RAW / DM_HDR_SHOT_HEIC additionally keep the exact RGB10A2 words and a 10-bit BT.2100 PQ
+// image beside the PNG, for inspecting the codes the game actually produced. Opt-in: neither is on the
+// ordinary screenshot path, and a missing HEIC encoder is reported once without failing the PNG.
+static void hdr_shot_diag(id<MTLTexture> src, const char *path) {
+    static int raw = -1, heic = -1;
+    if (raw < 0) { const char *e = getenv("DM_HDR_SHOT_RAW"); raw = e && atoi(e) != 0; }
+    if (heic < 0) { const char *e = getenv("DM_HDR_SHOT_HEIC"); heic = e && atoi(e) != 0; }
+    if (!raw && !heic) return;
+    size_t w = src.width, h = src.height, row = w * 4;
+    id<MTLBuffer> buf = [g_dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = q_cb();
+    if (!buf || !cb) { MLOG("[RED] HDR screenshot: no memory or command buffer for the readback"); return; }
+    id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+    if (!b) { MLOG("[RED] HDR screenshot: no blit encoder for the readback"); return; }
+    [b copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+              toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    [b endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) { MLOG("[RED] HDR screenshot: readback failed"); return; }
+    int flip = atomic_load_explicit(&g_origin_ll, memory_order_relaxed);
+    if (raw) {
+        char rp[1024]; snprintf(rp, sizeof rp, "%s.raw", path);
+        FILE *f = fopen(rp, "wb");
+        if (f) { fprintf(f, "rgb10a2 %zu %zu\n", w, h);
+            const uint8_t *p = buf.contents;
+            for (size_t y = 0; y < h; y++) fwrite(p + (flip ? h - 1 - y : y) * row, 1, row, f);
+            fclose(f); }
+        else MLOG("[RED] HDR screenshot: cannot write %s", rp);
+    }
+    if (heic) {
+        // Apple's image path shows PQ 203 nits as SDR white, the layer shows the paper white there, so
+        // rescale the codes to keep every level's ratio to the white in the HEIC.
+        uint16_t lut[1024]; double k = 203.0 / dm_hdr_paper_white();
+        for (int c = 0; c < 1024; c++) {
+            double nits = hdr_pq_nits(c / 1023.0) * k;
+            double code = hdr_pq_code(fmin(nits, 10000.0));
+            lut[c] = (uint16_t)lround(code * 65535.0);
+        }
+        uint16_t *px = malloc(w * h * 8);
+        if (px) {
+            const uint8_t *p = buf.contents;
+            for (size_t y = 0; y < h; y++) {
+                const uint32_t *s = (const uint32_t *)(p + (flip ? h - 1 - y : y) * row);
+                uint16_t *d = px + y * w * 4;
+                for (size_t x = 0; x < w; x++) for (int c = 0; c < 3; c++) d[4 * x + c] = lut[(s[x] >> (10 * c)) & 0x3ff];
+                for (size_t x = 0; x < w; x++) d[4 * x + 3] = 0xffff;
+            }
+            CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+            CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, w * h * 8, NULL);
+            CGImageRef img = cs && dp ? CGImageCreate(w, h, 16, 64, w * 8, cs, kCGBitmapByteOrder16Little | (CGBitmapInfo)kCGImageAlphaNoneSkipLast, dp, NULL, false, kCGRenderingIntentDefault) : NULL;
+            char hp[1024]; size_t n = strlen(path);
+            snprintf(hp, sizeof hp, "%.*s.heic", n > 4 && !strcmp(path + n - 4, ".png") ? (int)(n - 4) : (int)n, path);
+            CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)hp, strlen(hp), false);
+            CGImageDestinationRef dst = url ? CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypeHEIC.identifier, 1, NULL) : NULL;
+            int ok = 0;
+            if (img && dst) { CGImageDestinationAddImage(dst, img, (__bridge CFDictionaryRef)@{ (__bridge id)kCGImageDestinationLossyCompressionQuality: @1.0 }); ok = CGImageDestinationFinalize(dst); }
+            if (!ok) MLOG("[RED] HDR screenshot: %s was not written (no HEIC encoder, or the folder is not writable)", hp);
+            if (dst) CFRelease(dst); if (url) CFRelease(url); CGImageRelease(img); CGDataProviderRelease(dp); CGColorSpaceRelease(cs); free(px);
+        }
+    }
+}
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]) {
     static int out_w = -1, out_h;
     if (out_w < 0) {
@@ -18451,7 +18533,9 @@ static void shot(id<MTLTexture> src, const char *path, int screen, const int cro
     }
     id<MTLTexture> read = src;
     NSUInteger r[4]; int cropped = screen && !out_w && present_crop_rect(src, crop, r) && (r[0] || r[1] || r[2] != src.width || r[3] != src.height);
-    if ((out_w || cropped) && screen) {
+    int pq = screen && present_pq(src);
+    if (pq) hdr_shot_diag(src, path);
+    if ((out_w || cropped || pq) && screen) {
         NSUInteger ow = out_w ? (NSUInteger)out_w : src.width, oh = out_w ? (NSUInteger)out_h : src.height;
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:ow height:oh mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
@@ -18746,20 +18830,75 @@ int mtl_display_hz(void) {
 }
 static _Atomic uint64_t g_present_stall_ns;   // For unit tests: an extra pause before each present on the present thread (simulating a drawable that stays unavailable)
 void mtl_present_test_stall(uint64_t ns) { g_present_stall_ns = ns; }
-static void present_pipeline(MTLPixelFormat format) {
-    if (!g_blit_pso || g_blit_fmt != format) {
-        NSError *e = nil;
-        id<MTLLibrary> lib = host_lib("present", &e);
-        if (!lib) MDIE("present shader compile failed %s", e.localizedDescription.UTF8String);
-        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
-        pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:@"fs"];
-        pd.colorAttachments[0].pixelFormat = format;
-        g_blit_pso = dev_rps(pd, &e);
-        if (!g_blit_pso) MDIE("present pipeline failed %s", e.localizedDescription.UTF8String);
-        g_blit_fmt = format;
+static id<MTLRenderPipelineState> present_pipeline(MTLPixelFormat format, int variant) {
+    pthread_mutex_lock(&g_blit_mu);
+    for (int i = 0; i < g_present_pso_n; i++)
+        if (g_present_pso[i].fmt == format && g_present_pso[i].variant == variant) {
+            id<MTLRenderPipelineState> p = g_present_pso[i].pso; pthread_mutex_unlock(&g_blit_mu); return p;
+        }
+    NSError *e = nil;
+    id<MTLLibrary> lib = host_lib("present", &e);
+    if (!lib) MDIE("present shader compile failed %s", e.localizedDescription.UTF8String);
+    static NSString *const fn[PV_N] = {@"fs", @"fs_hdr", @"fs_hdr_fx"};
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"]; pd.fragmentFunction = [lib newFunctionWithName:fn[variant]];
+    pd.colorAttachments[0].pixelFormat = format;
+    id<MTLRenderPipelineState> pso = dev_rps(pd, &e);
+    if (!pso) MDIE("present pipeline failed %s", e.localizedDescription.UTF8String);
+    if (!g_blit_samp) {
         MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new]; sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear; sd.supportArgumentBuffers = YES;
         g_blit_samp = [g_dev newSamplerStateWithDescriptor:sd];
     }
+    atomic_fetch_add(&g_present_pso_new, 1);   // for DM_HDR_BENCH: a non-zero steady-state count means pipelines are still being made
+    if (g_present_pso_n == 8) g_present_pso_n = 0;   // more than eight format/variant pairs: replace on use
+    g_present_pso[g_present_pso_n].fmt = format; g_present_pso[g_present_pso_n].variant = variant;
+    g_present_pso[g_present_pso_n++].pso = pso;
+    pthread_mutex_unlock(&g_blit_mu);
+    return pso;
+}
+// The picture's encoding and the target decide which conversion the present pass does. An RGB10A2 window is
+// PQ only once vi has answered HDR (hdr.c); before that it is an ordinary gamma-coded 10-bit SDR picture.
+static int present_pq(id<MTLTexture> src) { return src.pixelFormat == MTLPixelFormatRGB10A2Unorm && dm_hdr_told(); }
+// The common (no roll-off) variant; the pass itself uses the exact result from present_params.
+static int present_variant(int pq, MTLPixelFormat dst) {
+    return (pq && dst == MTLPixelFormatRGB10A2Unorm) || (!pq && dst != MTLPixelFormatRGB10A2Unorm) ? PV_SDR : PV_HDR;
+}
+static float present_sdr_gamma(void) {
+    static float g = -1;
+    if (g < 0) { const char *e = getenv("DM_SDR_COLORSPACE"); g = e && !strcmp(e, "srgb") ? 0.0f : e && !strcmp(e, "g24") ? 2.4f : 2.2f; }
+    return g;
+}
+static float present_pq_code(float nits) {
+    if (!(nits > 0)) return 0;
+    double y = pow(fmin(nits, 10000.0) / 10000.0, HDR_PQ_M1);
+    return (float)pow((HDR_PQ_C1 + HDR_PQ_C2 * y) / (1.0 + HDR_PQ_C3 * y), HDR_PQ_M2);
+}
+// Fills the Crop.mode / xf part of the present constants and returns the shader variant to use.
+static int present_params(id<MTLTexture> src, MTLPixelFormat dst, float p[8]) {
+    memset(p, 0, sizeof(float) * 8);
+    int pq = present_pq(src);
+    float paper = (float)dm_hdr_paper_white(), mode = 0;
+    if (pq && dst == MTLPixelFormatRGB10A2Unorm) {
+        float knee = 0, target = 0, source = 0;
+        // Native PQ presentation: the game's HDR10 values go into a BT.2100 PQ drawable unchanged. Only if
+        // the game may draw above what the screen shows right now do we roll the highlights off (mode 4);
+        // the knee is never below its reference white, so ordinary picture brightness is not touched.
+        if (dm_hdr_rolloff(&knee, &target, &source)) {
+            mode = 4; p[2] = knee; p[3] = target; p[4] = source; p[5] = present_pq_code(knee);
+        }
+    } else if (pq) {   // HDR10 → SDR: a screenshot, or a frame while the layer is switching back
+        float pk = dm_hdr_source_peak();
+        mode = 1; p[2] = 0.75f; p[3] = 1.0f; p[4] = (pk > 0 ? pk : 1000.0f) / paper;
+    } else if (dst == MTLPixelFormatRGB10A2Unorm) {
+        mode = 2;   // the game's SDR window while it has not switched yet
+    }
+    p[0] = mode; p[1] = paper; p[6] = present_sdr_gamma();
+    int variant = mode == 0.0f ? PV_SDR : PV_HDR;
+    if (variant == PV_HDR) {
+        static int logged;
+        if (!logged) { logged = 1; MLOG("[hdr] present conversion mode %.0f: paper white %.0f nits, source peak %.0f, SDR gamma %.1f", mode, paper, p[4], p[6]); }
+    }
+    return variant;
 }
 // Present samples only the valid source rectangle declared by NVN; kept separate from the raw swapchain readback screenshot. Edges are clamped to the texel centers of the valid area, so bilinear does not read the black texels outside.
 // Present samples the raw bytes stored in the swapchain texture (the Switch's scan-out sends the stored bytes as they are): an sRGB source is replaced by a non-sRGB view of the same storage,
@@ -18816,7 +18955,8 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     if (memcmp(meta, last_crop, sizeof meta)) { memcpy(last_crop, meta, sizeof meta);
         MLOG("present crop: source texture %lux%lu, valid %lu,%lu %lux%lu → target %lux%lu", (unsigned long)src.width, (unsigned long)src.height,
              (unsigned long)cx, (unsigned long)cy, (unsigned long)cw, (unsigned long)ch, (unsigned long)dst.width, (unsigned long)dst.height); }
-    present_pipeline(dst.pixelFormat);
+    float pm[8]; int variant = present_params(src, dst.pixelFormat, pm);
+    id<MTLRenderPipelineState> pso = present_pipeline(dst.pixelFormat, variant);
     MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
     double dw = dst.width, dh = dst.height;
     MTLViewport vp = present_fit(src, dw, dh);
@@ -18829,9 +18969,10 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
     rp.colorAttachments[0].storeAction = MTLStoreActionStore;
     id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
     [en setViewport:vp];
-    [en setRenderPipelineState:g_blit_pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
-    float uv[8] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
-                   (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
+    [en setRenderPipelineState:pso]; [en setFragmentTexture:present_raw_src(src) atIndex:0]; [en setFragmentSamplerState:g_blit_samp atIndex:0];
+    float uv[16] = {(float)cx / src.width, (float)cy / src.height, (float)cw / src.width, (float)ch / src.height,
+                    (cx + 0.5f) / src.width, (cy + 0.5f) / src.height, (cx + cw - 0.5f) / src.width, (cy + ch - 0.5f) / src.height};
+    memcpy(uv + 8, pm, sizeof pm);
     if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     [en setFragmentBytes:uv length:sizeof uv atIndex:0];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -18846,8 +18987,39 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
 // Replacing the scaler waits for earlier presents; throttle replacement during resizing, and keep standard scaling for refused sizes. Offscreen captures own separate state.
 #define FX_REMAKE_PRESENTS 30
 // in, out: the scaler's own input and output (nil until needed); in_place_n, direct_n: presents that read the presented texture, wrote the canvas
-typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t made_at, in_place_n, direct_n; int made; NSUInteger refused[6]; } fx_state;
-static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
+typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; id<MTLTexture> decoded;   // decoded: source-size linear-light RGBA16Float for the HDR path
+                 uint64_t made_at, in_place_n, direct_n; int made;
+                 MTLFXSpatialScalerColorProcessingMode mode;   // 0 = perceptual (SDR), HDR = linear-light (PQ)
+                 NSUInteger refused[7]; } fx_state;
+static fx_state g_fx_present;   // SDR: perceptual, only the present thread encodes or replaces the scaler
+static fx_state g_fx_hdr = {.mode = MTLFXSpatialScalerColorProcessingModeHDR};   // HDR linear-light, RGBA16F -> RGBA16F
+// Test-only fault injection for the decoder/scaler failure paths. The weak default is zero in production;
+// t_present_crop defines a strong copy to force each failure and check the bilinear fallback and recovery.
+// Bit 1: decode pass failed. Bit 2: decode texture unavailable. Bit 4: scaler creation refused. Bit 8: encode failed.
+__attribute__((weak)) int dm_hdr_fx_test_fault;
+// One player preference, DM_PRESENT_UPSCALE, selects the present scaler in both SDR and HDR. DM_HDR_UPSCALE
+// survives only as an HDR-only diagnostic override: unset follows the player, off forces bilinear HDR and
+// hdrfx forces HDR MetalFX, so an old diagnostic value is explicit rather than a silent override of the launcher.
+enum { HDR_FX_UNREAD = -2, HDR_FX_INHERIT = -1, HDR_FX_OFF = 0, HDR_FX_ON = 1 };
+static int g_hdr_fx_choice = HDR_FX_UNREAD;
+static int fx_mode(void);   // defined below: the inherited choice when DM_HDR_UPSCALE is absent
+static int hdr_fx_on(void) {
+    if (g_hdr_fx_choice == HDR_FX_UNREAD) {
+        const char *e = getenv("DM_HDR_UPSCALE");
+        if (e && !strcmp(e, "hdrfx")) g_hdr_fx_choice = HDR_FX_ON;
+        else if (e && (!strcmp(e, "off") || !strcmp(e, "0"))) g_hdr_fx_choice = HDR_FX_OFF;
+        else g_hdr_fx_choice = HDR_FX_INHERIT;
+        if (g_hdr_fx_choice != HDR_FX_INHERIT)
+            MLOG("HDR upscaling (DM_HDR_UPSCALE): %s overrides the Upscaling setting", g_hdr_fx_choice == HDR_FX_ON ? "MetalFX" : "bilinear");
+    }
+    return g_hdr_fx_choice == HDR_FX_INHERIT ? fx_mode() : g_hdr_fx_choice;
+}
+void mtl_hdr_fx_reset(void) {   // tests / diagnostics A/B: re-read the setting and drop the HDR scaler
+    g_hdr_fx_choice = HDR_FX_UNREAD;
+    res_remove(g_fx_hdr.in); res_remove(g_fx_hdr.out); res_remove(g_fx_hdr.decoded);
+    g_fx_hdr.sc = nil; g_fx_hdr.in = g_fx_hdr.out = g_fx_hdr.decoded = nil; g_fx_hdr.made = 0;
+    memset(g_fx_hdr.refused, 0, sizeof g_fx_hdr.refused);
+}
 static id<MTL4Compiler> g_fx_comp;
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
 static int fx_mode(void) {
@@ -18867,7 +19039,9 @@ static int fx_wanted(MTLViewport vp, NSUInteger cw, NSUInteger ch) {
 }
 // A texture of the scaler's own (private, resident), made on first use; nil when it cannot be made
 static id<MTLTexture> fx_tex(__strong id<MTLTexture> *slot, MTLPixelFormat pf, NSUInteger w, NSUInteger h, MTLTextureUsage usage, NSString *label) {
-    if (*slot) return *slot;
+    if (*slot && (*slot).width == w && (*slot).height == h && (*slot).pixelFormat == pf) return *slot;
+    res_remove(*slot); *slot = nil;   // a resolution change needs a new texture, not a stale one of the old size
+
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
     td.storageMode = MTLStorageModePrivate; td.usage = usage;
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
@@ -18881,10 +19055,16 @@ static id<MTLTexture> fx_tex(__strong id<MTLTexture> *slot, MTLPixelFormat pf, N
 // iPad Pro 13" M4, Breath of the Wild 1920x1440 → 2752x2064: writing the canvas took the present command buffer from 1.61 to 1.34 ms
 static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTexture> raw, const NSUInteger r[4], MTLViewport vp, MTLPixelFormat out_pf, int remake_wait, id<MTLTexture> canvas, int *wrote) {
     NSUInteger cw = r[2], ch = r[3], ow = (NSUInteger)vp.width, oh = (NSUInteger)vp.height;
-    if (fx_mode() != 1 || !fx_wanted(vp, cw, ch)) return nil;
-    NSUInteger key[6] = {cw, ch, raw.pixelFormat, ow, oh, out_pf};
+    // Both scalers follow the player's DM_PRESENT_UPSCALE; hdr_fx_on() only adds the HDR-only diagnostic
+    // override. Standard therefore never reaches MetalFX, in SDR or in HDR.
+    if ((fx->mode ? hdr_fx_on() : fx_mode()) != 1 || !fx_wanted(vp, cw, ch)) return nil;
+    NSUInteger key[7] = {cw, ch, raw.pixelFormat, ow, oh, out_pf, (NSUInteger)fx->mode};
+    if (fx == &g_fx_hdr && (dm_hdr_fx_test_fault & 4)) { memcpy(fx->refused, key, sizeof key); return nil; }  // test-only refused descriptor
     id<MTL4FXSpatialScaler> sc = fx->sc;
     if (!sc || sc.inputWidth != cw || sc.inputHeight != ch || sc.colorTextureFormat != raw.pixelFormat || sc.outputWidth != ow || sc.outputHeight != oh || sc.outputTextureFormat != out_pf) {
+        // A configuration MetalFX refused stays refused until a reset or a size/format change: retrying a
+        // scaler that already failed to build would stall presentation every frame. A transient decode
+        // failure never reaches here and recovers on the next frame without any reset.
         if (!memcmp(key, fx->refused, sizeof key)) return nil;
         if (remake_wait && fx->made && g_present_n < fx->made_at + FX_REMAKE_PRESENTS) return nil;
         if (remake_wait) { pthread_mutex_lock(&g_pq_mu); while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu); }
@@ -18893,7 +19073,7 @@ static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTe
         if (!g_fx_comp) g_fx_comp = [g_dev newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&e];
         MTLFXSpatialScalerDescriptor *d = [MTLFXSpatialScalerDescriptor new];
         d.colorTextureFormat = raw.pixelFormat; d.outputTextureFormat = out_pf; d.inputWidth = cw; d.inputHeight = ch; d.outputWidth = ow; d.outputHeight = oh;
-        d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        d.colorProcessingMode = fx->mode ? MTLFXSpatialScalerColorProcessingModeHDR : MTLFXSpatialScalerColorProcessingModePerceptual;
         sc = g_fx_comp ? [d newSpatialScalerWithDevice:g_dev compiler:g_fx_comp] : nil;
         fx->made_at = g_present_n; fx->made++;
         if (!sc) { memcpy(fx->refused, key, sizeof key);
@@ -18917,8 +19097,51 @@ static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTe
     [sc encodeToCommandBuffer:cb];
     if (in_place && !fx->in_place_n++ && remake_wait) MLOG("present upscaling: MetalFX reads the presented texture itself (%lux%lu), no copy (DM_FX_INPLACE=0 copies it)", (unsigned long)cw, (unsigned long)ch);
     if (direct && !fx->direct_n++ && remake_wait) MLOG("present upscaling: MetalFX writes the drawable itself (%lux%lu), no present pass after it (DM_FX_DIRECT=0 keeps the pass)", (unsigned long)ow, (unsigned long)oh);
+    if (fx == &g_fx_hdr && (dm_hdr_fx_test_fault & 8)) return nil;   // test-only scaler encode failure
     *wrote = direct;
     return out;
+}
+// Decode the game's BT.2020 PQ window into the scaler's linear-light input at SOURCE resolution. Paper
+// full scale (10000 nits) normalises to 1.0: the tone map then works in a precise half-float range, not PQ
+// code values. The texture is source-sized (about 10 MiB at 1536x864), not drawable-sized, and is reused.
+static id<MTLRenderPipelineState> g_fx_decode_pso;
+static id<MTLRenderPipelineState> hdr_fx_decode_pso(void) {
+    if (g_fx_decode_pso) return g_fx_decode_pso;
+    NSError *e = nil; id<MTLLibrary> lib = host_lib("present", &e);
+    if (!lib) { MLOG("[RED] HDR MetalFX: present library: %s", e.localizedDescription.UTF8String); return nil; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vs"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"fs_pq_decode"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+    g_fx_decode_pso = dev_rps(pd, &e);
+    if (!g_fx_decode_pso) MLOG("[RED] HDR MetalFX: decode pipeline: %s", e.localizedDescription.UTF8String);
+    return g_fx_decode_pso;
+}
+static int hdr_fx_decode(id<MTL4CommandBuffer> cb, id<MTLTexture> src, const NSUInteger r[4], id<MTLTexture> dst, int slot) {
+    if (dm_hdr_fx_test_fault & 1) return 0;   // test-only: a failed decode must select the bilinear fallback
+    id<MTLRenderPipelineState> pso = hdr_fx_decode_pso();
+    id<MTL4ArgumentTable> args = g_fx_decode_args[slot]; id<MTLBuffer> uvb = g_fx_decode_uv[slot];
+    if (!pso || !src || !dst || !args || !uvb) return 0;
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTL4RenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    if (!en) return 0;
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
+    [en setArgumentTable:args atStages:MTLRenderStageFragment];
+    [args setTexture:src.gpuResourceID atIndex:0];
+    [args setSamplerState:g_blit_samp.gpuResourceID atIndex:0];
+    float *uv = uvb.contents; double tw = src.width, th = src.height;
+    uv[0] = (float)r[0] / tw; uv[1] = (float)r[1] / th; uv[2] = (float)r[2] / tw; uv[3] = (float)r[3] / th;
+    uv[4] = (r[0] + 0.5f) / tw; uv[5] = (r[1] + 0.5f) / th; uv[6] = (r[0] + r[2] - 0.5f) / tw; uv[7] = (r[1] + r[3] - 0.5f) / th;
+    uv[8] = 10000.0f;   // PQ's full-scale luminance: keeps the scaler's tone map in a precise half-float range
+    at_addr(args, uvb.gpuAddress, 0, "HDR decode table slot", 1);
+    MTLViewport vp = {0, 0, (double)dst.width, (double)dst.height, 0, 1};
+    [en setViewport:vp]; [en setRenderPipelineState:pso];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    m4_end(en);
+    return 1;
 }
 // ---------- A game's own upscaler drawn by MetalFX (DM_UPSCALER) ----------
 // Donkey Kong Bananza upscales its frame with agl's NDSR network: one compute dispatch (agl_ndsr.pck, 24 variants; Splatoon Raiders ships 20) reading the scene colour (texture slot 0, R11G11B10F; see up_mfx_color)
@@ -19140,15 +19363,70 @@ static int up_mfx_encode(NvShader *cs) {
 // (fx: the scaler state to use, nil = bilinear). uvb: the pass's crop constants (one buffer per present allocator, written by the CPU)
 static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], id<MTLBuffer> uvb, fx_state *fx) {
     NSUInteger r[4]; if (!present_crop_rect(src, crop, r)) return 0;
-    present_pipeline(dst.pixelFormat);
+    float pm[8]; int variant = present_params(src, dst.pixelFormat, pm);
+    id<MTLRenderPipelineState> pso = present_pipeline(dst.pixelFormat, variant);
     double dw = dst.width, dh = dst.height;
     MTLViewport vp = present_fit(src, dw, dh);
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
     int flipped = atomic_load_explicit(&g_origin_ll, memory_order_relaxed), wrote = 0;
     static int direct_ok = -1; if (direct_ok < 0) { const char *e = getenv("DM_FX_DIRECT"); direct_ok = !(e && !strcmp(e, "0")); }
-    // The picture fills dst unflipped: MetalFX may write dst itself, as the pass would only copy its output 1:1 (fx_encode)
-    id<MTLTexture> tex = present_raw_src(src), up = fx ? fx_encode(fx, cb, tex, r, vp, dst.pixelFormat, fx == &g_fx_present, direct_ok && full && !flipped ? dst : nil, &wrote) : nil;
+    // MetalFX's present scaler runs in perceptual mode on the game's gamma-encoded SDR bytes. Never feed it
+    // PQ code values or a picture that still has to be converted for the target: that is the oversharpened,
+    // highlighted-overshoot result of PR #1176. The bilinear present pass scales those pictures instead.
+    // HDR follows the same Upscaling choice as SDR: with MetalFX, PQ is decoded to linear RGBA16Float at
+    // source resolution (paper white = 1.0), scaled in MetalFX's HDR mode, then PQ-encoded once in the pass.
+    int hdr_path = present_pq(src) || pm[0] != 0.0f;
+    int slot = 0; for (int i = 0; i < 3; i++) if (uvb == g_present_uv[i]) { slot = i; break; }
+    fx_state *use = fx;
+    if (hdr_path) {
+        use = nil;
+        // Mode 4 (headroom shoulder) is compatible: fs_hdr_fx applies the same shoulder once, after scaling.
+        // No decode or scaler work when the picture is not enlarged; transitions (PQ -> SDR, SDR -> PQ) keep
+        // their conversion pass and are scaled bilinearly.
+        if (present_pq(src) && (pm[0] == 0.0f || pm[0] == 4.0f) && dst.pixelFormat == MTLPixelFormatRGB10A2Unorm &&
+            fx_wanted(vp, r[2], r[3]) && hdr_fx_on()) {
+            use = &g_fx_hdr;
+            static int once; if (!once++)
+                MLOG("[hdr] HDR MetalFX (Upscaling=MetalFX): PQ -> linear RGBA16F -> MetalFX HDR -> PQ encode; Standard stays bilinear");
+        } else if (fx == &g_fx_present && fx_mode() == 1) {
+            static int once; if (!once++)
+                MLOG("[hdr] HDR picture (present mode %.0f): scaling bilinearly; HDR MetalFX is off, overridden or not eligible here", pm[0]);
+        }
+    }
+    // The picture fills dst unflipped: the SDR scaler may write dst itself, as the pass would only copy its
+    // output 1:1 (fx_encode). The HDR path keeps its own float output so the present can PQ-encode it.
+    id<MTLTexture> raw = present_raw_src(src), tex = raw;
+    id<MTLTexture> canvas_out = use == &g_fx_hdr ? nil : (direct_ok && full && !flipped && pm[0] == 0.0f ? dst : nil);
+    NSUInteger fr[4] = {r[0], r[1], r[2], r[3]};
+    MTLPixelFormat out_pf = dst.pixelFormat;
+    int decoded = 0, hdr_use = use == &g_fx_hdr;
+    if (hdr_use) {
+        NSUInteger cw = r[2], ch = r[3];
+        if (!(dm_hdr_fx_test_fault & 2) && (!g_fx_hdr.decoded || g_fx_hdr.decoded.width != cw || g_fx_hdr.decoded.height != ch)) {
+            // A resolution change drops the old texture only after the presents that could still read it.
+            pthread_mutex_lock(&g_pq_mu); while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);
+            res_remove(g_fx_hdr.decoded); g_fx_hdr.decoded = nil;
+            g_fx_hdr.decoded = fx_tex(&g_fx_hdr.decoded, MTLPixelFormatRGBA16Float, cw, ch, MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead, @"present HDR decode");
+        }
+        if (g_fx_hdr.decoded && hdr_fx_decode(cb, raw, r, g_fx_hdr.decoded, slot)) {
+            tex = g_fx_hdr.decoded; fr[0] = fr[1] = 0; fr[2] = cw; fr[3] = ch;
+            out_pf = MTLPixelFormatRGBA16Float; decoded = 1;
+        }
+        // Invariant: MetalFX must never see the original PQ texture, and fs_hdr_fx must never read a
+        // non-float output as linear light. Any decode failure selects the bilinear PQ presentation.
+        if (!decoded) { use = nil; tex = raw; out_pf = dst.pixelFormat; }
+    }
+    id<MTLTexture> up = use ? fx_encode(use, cb, tex, fr, vp, out_pf, use == &g_fx_present || use == &g_fx_hdr, canvas_out, &wrote) : nil;
+    if (!up) wrote = 0;
+    if (hdr_use && (!up || !decoded)) { up = nil; wrote = 0; use = nil; tex = raw; }  // refused scaler / encode failure
     if (wrote) return PRESENT_METALFX;
+    if (up && use == &g_fx_hdr) {
+        // The scaler's linear-light output is in paper whites: one shoulder and one PQ encode, here only.
+        variant = PV_HDR_FX; pso = present_pipeline(dst.pixelFormat, variant);
+        pm[0] = 5; pm[1] = 10000.0f; pm[2] = pm[3] = pm[4] = 0;   // the float texture is nits / 10000
+        float knee = 0, target = 0, source = 0;
+        if (dm_hdr_rolloff(&knee, &target, &source)) { pm[2] = knee; pm[3] = target; pm[4] = source; }
+    }
     if (up && fx == &g_fx_present) { static int once; if (!once++)
         MLOG("present upscaling: the present pass draws MetalFX's output into the drawable: %s (drawable %lux%lu format %lu usage %#lx, picture %lux%lu)",
              !direct_ok ? "DM_FX_DIRECT=0" : !full ? "the picture does not fill it" : flipped ? "the lower-left origin flips it" : "the scaler cannot write it",
@@ -19168,9 +19446,10 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     float *uv = uvb.contents; NSUInteger tw = tex.width, th = tex.height, cx = r[0], cy = r[1], cw = r[2], ch = r[3];
     uv[0] = (float)cx / tw; uv[1] = (float)cy / th; uv[2] = (float)cw / tw; uv[3] = (float)ch / th;
     uv[4] = (cx + 0.5f) / tw; uv[5] = (cy + 0.5f) / th; uv[6] = (cx + cw - 0.5f) / tw; uv[7] = (cy + ch - 0.5f) / th;
+    memcpy(uv + 8, pm, sizeof pm);
     if (flipped) { uv[1] += uv[3]; uv[3] = -uv[3]; }   // lower-left origin: the window image is stored bottom-up
     at_addr(g_present_args, uvb.gpuAddress, 0, "present table slot", 1);
-    [en setViewport:vp]; [en setRenderPipelineState:g_blit_pso];
+    [en setViewport:vp]; [en setRenderPipelineState:pso];
     [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     m4_end(en);
     return up ? PRESENT_METALFX : PRESENT_STANDARD;
@@ -19179,7 +19458,7 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
 // returns whether it was submitted. Completion reports the encoding kind, or PRESENT_FAILED on a GPU error. Resources remain resident and retained until GPU completion.
 static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
     id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
-    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 16 options:MTLResourceStorageModeShared];   // crop + HDR conversion parameters
     if (!al || !cb || !uvb) { MLOG("[RED] offscreen present: no command allocator or buffer"); return 0; }
     id<MTLTexture> raw = present_raw_src(src);
     fx_state fx = {0};
@@ -19216,6 +19495,60 @@ static void present_gpu_note(double s, int fx) {
     MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", fx ? "through MetalFX" : "through the bilinear pass", a[299], a[569], a[599]);
     n[fx] = 0;
 }
+// Optional SDR/HDR A/B benchmark (DM_HDR_BENCH=1): collects frame intervals, the display command buffer's
+// GPU time and the drawable's actual on-screen latency over 600 presents, then logs one [hdr-bench] line.
+// It is off by default and adds no work to the production path. The three clocks are kept separate: the
+// interval is wall time between presents (frame pacing), GPU time is the commit feedback's own span, and
+// latency is the drawable's presentedTime minus the moment this thread handed it to the system (which
+// includes ordinary frame buffering -- it is not, by itself, HDR overhead).
+static int hdr_bench_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_HDR_BENCH"); v = e && *e && strcmp(e, "0") != 0; } return v; }
+static pthread_mutex_t g_bench_mu = PTHREAD_MUTEX_INITIALIZER;
+static double g_bench_frame[600], g_bench_gpu[600], g_bench_lat[600];
+static int g_bench_nf, g_bench_ng, g_bench_nl;
+static int64_t g_bench_prev_ns;
+static double bench_footprint_mb(void) {
+#if TARGET_OS_OSX
+    task_vm_info_data_t info; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &n) == KERN_SUCCESS)
+        return (double)info.phys_footprint / (1024.0 * 1024.0);
+#endif
+    return 0;
+}
+static void bench_add(double *v, int *n, double x) {
+    if (!hdr_bench_on()) return;
+    pthread_mutex_lock(&g_bench_mu);
+    if (*n < 600) v[(*n)++] = x;
+    pthread_mutex_unlock(&g_bench_mu);
+}
+static double bench_pct(double *v, int n, double frac) {
+    if (!n) return 0;
+    double a[600]; memcpy(a, v, (size_t)n * sizeof *v);
+    for (int i = 1; i < n; i++) { double x = a[i]; int j = i - 1; while (j >= 0 && a[j] > x) { a[j + 1] = a[j]; j--; } a[j + 1] = x; }
+    return a[n - 1 - (int)(frac * (n - 1))];   // frac 0 = max, 0.5 = median
+}
+static void hdr_bench_note(void) {
+    if (!hdr_bench_on()) return;
+    pthread_mutex_lock(&g_bench_mu);
+    int nf = g_bench_nf, ng = g_bench_ng, nl = g_bench_nl;
+    double fr[600], gp[600], lt[600];
+    memcpy(fr, g_bench_frame, (size_t)nf * sizeof *fr);
+    memcpy(gp, g_bench_gpu, (size_t)ng * sizeof *gp);
+    memcpy(lt, g_bench_lat, (size_t)nl * sizeof *lt);
+    g_bench_nf = g_bench_ng = g_bench_nl = 0;
+    pthread_mutex_unlock(&g_bench_mu);
+    int over167 = 0, over20 = 0;
+    double frame_max = 0, lat_max = 0;
+    for (int i = 0; i < nf; i++) { over167 += fr[i] > 16.67; over20 += fr[i] > 20.0; if (fr[i] > frame_max) frame_max = fr[i]; }
+    for (int i = 0; i < nl; i++) if (lt[i] > lat_max) lat_max = lt[i];
+    LOG("[hdr-bench] presents %llu: frame ms p50 %.2f p95 %.2f p99 %.2f (max %.2f), %d over 16.67 and %d over 20 of %d; "
+        "GPU ms p50 %.2f p95 %.2f p99 %.2f of %d; on-screen latency ms p50 %.1f p90 %.1f max %.1f of %d; "
+        "footprint %.0f MB, new present pipelines %d, HDR %s",
+        (unsigned long long)g_present_n, bench_pct(fr, nf, 0.5), bench_pct(fr, nf, 0.05), bench_pct(fr, nf, 0.01),
+        frame_max, over167, over20, nf,
+        bench_pct(gp, ng, 0.5), bench_pct(gp, ng, 0.05), bench_pct(gp, ng, 0.01), ng,
+        bench_pct(lt, nl, 0.5), bench_pct(lt, nl, 0.1), lat_max, nl,
+        bench_footprint_mb(), atomic_exchange(&g_present_pso_new, 0), dm_hdr_on() ? "on" : "off");
+}
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
 // External presents wait on g_q4, but diagnostic readback can use another queue. Wait for the producer before any read of that frame.
 static id<MTLSharedEvent> g_ext_ev;
@@ -19231,6 +19564,12 @@ static void present_shot(id<MTLTexture> src, const char *path, const int crop[4]
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], uint64_t ev_val, id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
+    if (hdr_bench_on()) {   // wall time between presents: the game's frame pacing, not the GPU's execution time
+        int64_t bt = now_ns();
+        if (g_bench_prev_ns) bench_add(g_bench_frame, &g_bench_nf, (bt - g_bench_prev_ns) / 1e6);
+        g_bench_prev_ns = bt;
+        if (g_present_n % 600 == 0) hdr_bench_note();
+    }
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
         MLOG("[bootprof] t=%.3f s present #%llu: metallibs loaded %llu / %.1f ms; pipelines created %llu / %.1f ms (all synchronous on the submit thread); prewarmed and used: shaders %llu / render pipelines %llu / compute pipelines %llu; "
@@ -19242,6 +19581,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     PD("X ser=%llu", t->serial);
     id<MTLTexture> src = tex_mtl(t);
     if (!src) { RED_ONCE(8, "present texture could not get an MTLTexture"); return 0; }
+    // How many presents in a row drew a non-PQ picture: the front end keeps the PQ layer until the game has
+    // rebuilt its window after an SDR answer, so no HDR frame ever lands on an SDR drawable.
+    dm_hdr_present(present_pq(src));
     // The picture's shape for the front end's layout (front.h front_picture_shape): reported when its width / height changes by more than 0.1 %, not on a size change of the same
     // shape (1280x720 handheld, 1920x1080 docked)
     { static double last; double w, h; present_shape(src, &w, &h); double a = w / h;
@@ -19293,7 +19635,13 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 #if TARGET_OS_OSX
     if (!layer.displaySyncEnabled) layer.displaySyncEnabled = YES;   // Windowed mode follows the display's vsync to prevent tearing
 #endif
-    present_pipeline(layer.pixelFormat);   // Same as the original path: the first frame compiles the pipeline before taking the drawable
+    // Same as the original path: compile the pipeline before taking the drawable. The pass itself selects
+    // the pipeline by the *acquired drawable's* format (which can still be the SDR one during a switch).
+    { float pm[8]; present_params(src, layer.pixelFormat, pm); present_pipeline(layer.pixelFormat, pm[0] != 0.0f ? PV_HDR : PV_SDR);
+      if (hdr_fx_on() && present_pq(src) && layer.pixelFormat == MTLPixelFormatRGB10A2Unorm) {
+          hdr_fx_decode_pso();   // compile the opt-in HDR scaler's passes before taking the drawable
+          present_pipeline(layer.pixelFormat, PV_HDR_FX);
+      } }
     if (g_grab_cb) grab_present(src, crop, layer.drawableSize);   // Game picture needed by the whole-window screenshot (peek without the lock first; the real take locks inside the function)
     uint64_t dt0 = now_ns();
     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
@@ -19320,7 +19668,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         if (f.error) { MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "display"); }
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; if (ticket > g_present_alloc_done[alloc_i]) g_present_alloc_done[alloc_i] = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv);
         NSArray *retire = nil; if (!g_pq_inflight && g_ext_retire.count) { retire = g_ext_retire; g_ext_retire = nil; }   // every present committed before their release has completed
-        present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind); pthread_mutex_unlock(&g_pq_mu);
+        present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind);
+        if (hdr_bench_on()) bench_add(g_bench_gpu, &g_bench_ng, (f.GPUEndTime - f.GPUStartTime) * 1e3);
+        pthread_mutex_unlock(&g_pq_mu);
         if (retire) ext_retire(retire);
     }];
     id<MTL4CommandBuffer> buffers[] = {cb};
@@ -19347,10 +19697,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     (void)period; [dr present];
 #else
     uint64_t pn = ticket;   // Record the present time by the game's present sequence number (ticket number): hle's present statistics are taken by "the game's nth present"; in the display link path the actual present count != the game's present count (old frames get merged and dropped)
+    __block double bench_call = hdr_bench_on() ? CACurrentMediaTime() : 0;
     [dr addPresentedHandler:^(id<MTLDrawable> d) {   // Actual presentation time (the time this frame is really put on screen, CACurrentMediaTime base)
         CFTimeInterval tt = d.presentedTime;
         g_pres[pn % PRING] = (pres_ent){pn, tt > 0 ? tt : -1};
         pres_seen(pn, tt);
+        if (bench_call && tt > 0) bench_add(g_bench_lat, &g_bench_nl, (tt - bench_call) * 1e3);
     }];
     // Each frame is displayed for at least one present period: when the GPU completion time jitters around a 120 Hz refresh boundary, the paired "25 ms + 8.33 ms" stutter no longer appears
     if (target_ts > 0) [dr present];

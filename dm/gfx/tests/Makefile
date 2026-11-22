@@ -132,6 +132,17 @@ t_host_msl: t_host_msl.m ../nvn/host_msl.m ../nvn/host_msl.h $(MSL_H)
 	clang -O1 -g -Wall -I$(dir $(MSL_H)) -fobjc-arc -o $@ t_host_msl.m ../nvn/host_msl.m -framework Metal -framework Foundation
 t_builtin: t_builtin.m ../nvn/nvn_builtin.h ../nvn/host_msl.m $(MSL_H)
 	clang -O1 -g -Wall -I$(dir $(MSL_H)) -fobjc-arc -o $@ t_builtin.m ../nvn/host_msl.m -framework Metal -framework Foundation
+t_hdr: t_hdr.c ../nvn/hdr.c ../nvn/hdr.h $(GAME_H)
+	clang $(CFLAGS) -o $@ t_hdr.c ../nvn/hdr.c
+.PHONY: check_t_hdr
+check_t_hdr: t_hdr
+	./t_hdr
+# MetalFX HDR investigation: which formats the installed SDK's spatial scaler accepts (informational)
+t_hdr_mfx: t_hdr_mfx.m
+	clang -O1 -g -Wall -fobjc-arc -o $@ t_hdr_mfx.m -framework Metal -framework MetalFX -framework Foundation
+.PHONY: check_t_hdr_mfx
+check_t_hdr_mfx: t_hdr_mfx
+	./t_hdr_mfx
 t_vin: t_vin.m
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_vin.m -framework Metal -framework Foundation
 t_tbuf2d: t_tbuf2d.m ../nvn/nvn_tex.c ../nvn/nvn_tex.h

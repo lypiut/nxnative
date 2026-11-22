@@ -39,6 +39,21 @@ def audio_input_capable(modules):
     return False
 
 
+# A Switch 2 game that renders HDR itself imports vi's HDR status query. This is a *candidate* check only:
+# an import does not prove the game handles the answer or that its HDR path has been validated. The game
+# profile's `hdr on` key stays the source of verified compatibility (dm/games/game.py's DM_GAME_HDR).
+_QUERY_DISPLAY_HDR_STATUS = '_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE'
+
+
+def hdr_import_capable(modules):
+    for module in modules:
+        if not module.name.endswith('.patched.bin'): continue
+        try: symbols = dynsyms(module.read_bytes())
+        except (AssertionError, KeyError, IndexError, ValueError, struct.error): continue
+        if any(name == _QUERY_DISPLAY_HDR_STATUS and not defined for name, defined, _ in symbols): return True
+    return False
+
+
 def defined(img):   # {name: (offset, size)} of the module's defined dynamic symbols; {} without a symbol table it can read (New Super Mario Bros. U Deluxe's sdk: a 32-bit module, whose dynamic table has 8-byte entries)
     try:
         mod0 = struct.unpack_from('<I', img, 4)[0]
